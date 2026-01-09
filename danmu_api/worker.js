@@ -8,10 +8,21 @@ import { getBangumi, getComment, getCommentByUrl, getSegmentComment, matchAnime,
 import { handleConfig, handleUI, handleLogs, handleClearLogs, handleDeploy, handleClearCache } from "./apis/system-api.js";
 import { handleSetEnv, handleAddEnv, handleDelEnv } from "./apis/env-api.js";
 import { Segment } from "./models/dandan-model.js"
+import { initSpeedInsights, trackEndpointPerformance } from "./utils/speed-insights-util.js"
 
 let globals;
+let speedInsightsInitialized = false;
 
 async function handleRequest(req, env, deployPlatform, clientIp) {
+  // Initialize Speed Insights once on first request
+  if (!speedInsightsInitialized) {
+    initSpeedInsights();
+    speedInsightsInitialized = true;
+  }
+
+  // Track performance using Speed Insights
+  const startTime = Date.now();
+  
   // 加载全局变量和环境变量配置
   globals = Globals.init(env);
 
@@ -156,22 +167,26 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
 
   // GET /api/v2/search/anime
   if (path === "/api/v2/search/anime" && method === "GET") {
-    return searchAnime(url);
+    const response = await searchAnime(url);
+    return trackAndReturn(response, "/api/v2/search/anime", method, startTime);
   }
 
   // GET /api/v2/search/episodes
   if (path === "/api/v2/search/episodes" && method === "GET") {
-    return searchEpisodes(url);
+    const response = await searchEpisodes(url);
+    return trackAndReturn(response, "/api/v2/search/episodes", method, startTime);
   }
 
   // GET /api/v2/match
   if (path === "/api/v2/match" && method === "POST") {
-    return matchAnime(url, req);
+    const response = await matchAnime(url, req);
+    return trackAndReturn(response, "/api/v2/match", method, startTime);
   }
 
   // GET /api/v2/bangumi/:animeId
   if (path.startsWith("/api/v2/bangumi/") && method === "GET") {
-    return getBangumi(path);
+    const response = await getBangumi(path);
+    return trackAndReturn(response, path, method, startTime);
   }
 
   // GET /api/v2/comment/:commentId or /api/v2/comment?url=xxx
@@ -180,7 +195,7 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
     const videoUrl = url.searchParams.get('url');
     const segmentFlag = url.searchParams.get('segmentflag');
 
-    // ⚠️ 限流设计说明：
+    // ⚠️ 限流设计说��：
     // 1. 先检查缓存，缓存命中时直接返回，不计入限流次数
     // 2. 只有缓存未命中时才执行限流检查和网络请求
     // 3. 这样可以避免频繁访问同一弹幕时被限流，提高用户体验
@@ -227,16 +242,18 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
       }
 
       // 通过URL获取弹幕
-      return getCommentByUrl(videoUrl, queryFormat, segmentFlag);
+      const response = getCommentByUrl(videoUrl, queryFormat, segmentFlag);
+      return trackAndReturn(response, path, method, startTime);
     }
 
     // 否则通过commentId获取弹幕
     if (!path.startsWith("/api/v2/comment/")) {
       log("error", "Missing commentId or url parameter");
-      return jsonResponse(
+      const response = jsonResponse(
         { errorCode: 400, success: false, errorMessage: "Missing commentId or url parameter" },
         400
       );
+      return trackAndReturn(response, path, method, startTime);
     }
 
     const commentId = parseInt(path.split("/").pop());
@@ -254,7 +271,7 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
 
     // 缓存未命中，执行限流检查（如果 rateLimitMaxRequests > 0 则启用限流）
     if (globals.rateLimitMaxRequests > 0) {
-      // 获取当前时间戳（单位：毫秒）
+      // 获取当前时间戳���单位：毫秒）
       const currentTime = Date.now();
       const oneMinute = 60 * 1000;  // 1分钟 = 60000 毫秒
 
@@ -287,7 +304,8 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
       log("info", `[Rate Limit] IP ${clientIp} request count: ${recentRequests.length}/${globals.rateLimitMaxRequests}`);
     }
 
-    return getComment(path, queryFormat, segmentFlag);
+    const response = getComment(path, queryFormat, segmentFlag);
+    return trackAndReturn(response, path, method, startTime);
   }
 
   // POST /api/v2/segmentcomment - 接收segment类的JSON请求体
@@ -303,59 +321,91 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
         segment = Segment.fromJson(requestBody);
       } catch (e) {
         log("error", "Invalid JSON in request body for segment");
-        return jsonResponse(
+        const response = jsonResponse(
           { errorCode: 400, success: false, errorMessage: "Invalid JSON in request body" },
           400
         );
+        return trackAndReturn(response, path, method, startTime);
       }
 
       // 通过URL和平台获取分段弹幕
-      return getSegmentComment(segment, queryFormat);
+      const response = getSegmentComment(segment, queryFormat);
+      return trackAndReturn(response, path, method, startTime);
     } catch (error) {
       log("error", `Error processing segmentcomment request: ${error.message}`);
-      return jsonResponse(
+      const response = jsonResponse(
         { errorCode: 500, success: false, errorMessage: "Internal server error" },
         500
       );
+      return trackAndReturn(response, path, method, startTime);
     }
   }
 
   // GET /api/logs
   if (path === "/api/logs" && method === "GET") {
-    return handleLogs();
+    const response = handleLogs();
+    return trackAndReturn(response, "/api/logs", method, startTime);
   }
 
   // POST /api/logs/clear
   if (path === "/api/logs/clear" && method === "POST") {
-    return handleClearLogs();
+    const response = handleClearLogs();
+    return trackAndReturn(response, "/api/logs/clear", method, startTime);
   }
 
   // POST /api/env/set - 设置环境变量
   if (path === "/api/env/set" && method === "POST") {
-    return handleSetEnv(req);
+    const response = handleSetEnv(req);
+    return trackAndReturn(response, "/api/env/set", method, startTime);
   }
 
   // POST /api/env/add - 添加环境变量
   if (path === "/api/env/add" && method === "POST") {
-    return handleAddEnv(req);
+    const response = handleAddEnv(req);
+    return trackAndReturn(response, "/api/env/add", method, startTime);
   }
 
   // POST /api/env/del - 删除环境变量
   if (path === "/api/env/del" && method === "POST") {
-    return handleDelEnv(req);
+    const response = handleDelEnv(req);
+    return trackAndReturn(response, "/api/env/del", method, startTime);
   }
 
   // POST /api/deploy - 重新部署
   if (path === "/api/deploy" && method === "POST") {
-    return handleDeploy();
+    const response = handleDeploy();
+    return trackAndReturn(response, "/api/deploy", method, startTime);
   }
 
   // POST /api/cache/clear - 清理缓存
   if (path === "/api/cache/clear" && method === "POST") {
-    return handleClearCache();
+    const response = handleClearCache();
+    return trackAndReturn(response, "/api/cache/clear", method, startTime);
   }
 
-  return jsonResponse({ message: "Not found" }, 404);
+  const response = jsonResponse({ message: "Not found" }, 404);
+  
+  // Track endpoint performance
+  const endTime = Date.now();
+  const responseTime = endTime - startTime;
+  trackEndpointPerformance(url.pathname, req.method, responseTime, response.status);
+  
+  return response;
+}
+
+/**
+ * Wrapper to track performance for responses with start time tracking
+ * @param {Response} response - The response object
+ * @param {string} endpoint - The endpoint path
+ * @param {string} method - HTTP method
+ * @param {number} startTime - Request start time in milliseconds
+ * @returns {Response} The response object with performance tracked
+ */
+function trackAndReturn(response, endpoint, method, startTime) {
+  const endTime = Date.now();
+  const responseTime = endTime - startTime;
+  trackEndpointPerformance(endpoint, method, responseTime, response.status);
+  return response;
 }
 
 function isRunningOnVercel() {
@@ -418,7 +468,7 @@ export async function netlifyHandler(event, context) {
     body: event.body ? event.body : undefined,
   });
 
-  // 调用核心处理函数
+  // 调用核���处理函数
   const response = await handleRequest(request, process.env, "netlify", clientIp);
 
   // 转换为 Netlify 响应格式
