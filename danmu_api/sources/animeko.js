@@ -35,12 +35,15 @@ export default class AnimekoSource extends BaseSource {
    */
   async search(keyword) {
     try {
-      log("info", `[Animeko] 开始搜索 (V0): ${keyword}`);
+      // 标准化函数
+      const searchKeyword = keyword.replace(/[._]/g, ' ').replace(/\s+/g, ' ').trim();
+      
+      log("info", `[Animeko] 开始搜索 (V0): ${searchKeyword}`);
 
       const searchUrl = `https://api.bgm.tv/v0/search/subjects?limit=5`;
       
       const payload = {
-        keyword: keyword,
+        keyword: searchKeyword,
         filter: {
           type: [2] // 2 代表动画类型
         }
@@ -88,18 +91,64 @@ export default class AnimekoSource extends BaseSource {
   }
 
   /**
+   * 从文本中提取明确的季度数字
+   * @param {string} text 标题文本
+   * @returns {number|null} 季度数字，未找到返回 null
+   */
+  getExplicitSeasonNumber(text) {
+    if (!text) return null;
+    const cleanText = simplized(text);
+
+    // 1. 匹配阿拉伯数字 (S2, Season 2, 第2季)
+    // 排除 S01 或 第1季，因为通常第一季不带标号，需要特殊处理
+    const arabicMatch = cleanText.match(/(?:^|\s|\[|\(|（|【)(?:Season|S|第)\s*(\d+)(?:\s*季|期|部|Season|\]|\)|）|】)?/i);
+    if (arabicMatch && arabicMatch[1]) {
+      return parseInt(arabicMatch[1], 10);
+    }
+
+    // 2. 匹配中文数字 (第二季)
+    const cnNums = {'一':1, '二':2, '三':3, '四':4, '五':5, '六':6, '七':7, '八':8, '九':9, '十':10};
+    const cnMatch = cleanText.match(/第([一二三四五六七八九十]+)[季期部]/);
+    if (cnMatch && cnNums[cnMatch[1]]) {
+      return cnNums[cnMatch[1]];
+    }
+
+    return null;
+  }
+  /**
+   * 移除字符串中的标点符号、特殊符号和空白字符
+   * 兼容不支持 Unicode 属性转义的 Node.js 版本
+   * @param {string} str 输入字符串
+   * @returns {string} 清理后的字符串
+   */
+  removePunctuationAndSymbols(str) {
+    if (!str) return "";
+    
+    // 使用字符范围匹配常见标点和符号，而不是 Unicode 属性
+    // 包括：ASCII 标点、中文标点、各类符号、空白字符
+    return str.replace(/[\s\x20-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E\u2000-\u206F\u3000-\u3003\u3008-\u301F\u3030-\u303F\uFF01-\uFF0F\uFF1A-\uFF20\uFF3B-\uFF40\uFF5B-\uFF60\uFFE0-\uFFE6\uFF61-\uFF65\u2190-\u21FF\u2600-\u27BF]+/g, "");
+  }
+  /**
    * 过滤搜索结果
-   * 计算关键词与标题（含中文名、原名及别名）的相似度，剔除低相关度结果
+   * 包含基础相似度过滤和智能季度匹配逻辑
    * @param {Array} list 原始 API 返回结果列表
    * @param {string} keyword 用户搜索关键词
    * @returns {Array} 过滤后的结果列表
    */
   filterSearchResults(list, keyword) {
-    const threshold = 0.4; // 相似度阈值
-    const normalizedKeyword = simplized(keyword).toLowerCase().trim();
+    const threshold = 0.8; // 相似度阈值
+    
+    // 标准化函数
+    const normalize = (str) => {
+        if (!str) return "";
+        // 使用兼容方法替代 Unicode 属性正则
+        return this.removePunctuationAndSymbols(simplized(str).toLowerCase());
+    };
 
-    return list.filter(item => {
-      // 收集所有可能的标题用于比对
+    const normalizedKeyword = normalize(keyword);
+
+    // 1. 基础相似度过滤 (获取所有潜在相关结果)
+    const candidates = list.filter(item => {
       const titles = new Set();
       if (item.name) titles.add(item.name);
       if (item.name_cn) titles.add(item.name_cn);
@@ -119,13 +168,49 @@ export default class AnimekoSource extends BaseSource {
       // 计算最高相似度得分
       let maxScore = 0;
       for (const t of titles) {
-        const normalizedTitle = simplized(t).toLowerCase().trim();
+        // 使用去符号后的文本进行比对
+        const normalizedTitle = normalize(t);
         const score = this.calculateSimilarity(normalizedKeyword, normalizedTitle);
         if (score > maxScore) maxScore = score;
       }
 
       return maxScore >= threshold;
     });
+
+    if (candidates.length === 0) return [];
+
+    // 2. 智能季度匹配逻辑
+    // 尝试从关键词中提取目标季度
+    const targetSeason = this.getExplicitSeasonNumber(keyword);
+
+    // 规则1: 如果关键词包含明确的季度信息（且大于1，排除S1干扰），则执行严格匹配
+    if (targetSeason !== null && targetSeason > 1) {
+      log("info", `[Animeko] 检测到指定季度搜索: 第 ${targetSeason} 季`);
+
+      const strictMatches = candidates.filter(item => {
+        // 尝试从结果标题中提取季度，如果提取不到，默认为第 1 季
+        const seasonInName = this.getExplicitSeasonNumber(item.name);
+        const seasonInCn = this.getExplicitSeasonNumber(item.name_cn);
+        
+        // 只要任一标题匹配季度即可
+        // 注意：如果标题中没有季度标识（返回null），我们视为第1季
+        const itemSeason = (seasonInName !== null ? seasonInName : (seasonInCn !== null ? seasonInCn : 1));
+        
+        return itemSeason === targetSeason;
+      });
+
+      // 规则3: 如果有符合条件的结果，返回所有符合项
+      if (strictMatches.length > 0) {
+        return strictMatches;
+      }
+
+      // 规则2: 如果包含季度信息但找不到对应结果，返回最优选（第1个）
+      log("info", `[Animeko] 未找到第 ${targetSeason} 季对应条目，回退至最优结果`);
+      return [candidates[0]];
+    }
+
+    // 规则1(反向): 如果关键词不包含季度信息，走原原本本的逻辑 (返回所有高相似度结果)
+    return candidates;
   }
 
   /**
@@ -292,28 +377,72 @@ export default class AnimekoSource extends BaseSource {
 
   /**
    * 获取剧集列表
+   * Bangumi API 限制单次 limit=200，需循环获取完整列表
    * @param {number} subjectId 条目 ID
    * @returns {Promise<Array>} 剧集数组
    */
   async getEpisodes(subjectId) {
-    try {
-      const resp = await httpGet(`https://api.bgm.tv/v0/episodes?subject_id=${subjectId}`, {
-        headers: this.headers,
-      });
+    let allEpisodes = [];
+    let offset = 0;
+    const limit = 200;
 
-      if (!resp || !resp.data) {
-        log("info", `[Animeko] Subject ${subjectId} 无剧集数据`);
-        return [];
+    try {
+      while (true) {
+        // 构造分页 URL
+        const url = `https://api.bgm.tv/v0/episodes?subject_id=${subjectId}&limit=${limit}&offset=${offset}`;
+        
+        const resp = await httpGet(url, {
+          headers: this.headers,
+        });
+
+        // 1. 结构校验：确保 resp.data.data 存在且为数组
+        // 对应您的 JSON: resp.data 存在，resp.data.data 是 [] (数组)，校验通过
+        if (!resp || !resp.data || !Array.isArray(resp.data.data)) {
+          if (offset === 0) {
+             log("info", `[Animeko] Subject ${subjectId} 无剧集数据或响应异常`);
+          }
+          break;
+        }
+
+        const currentBatch = resp.data.data;
+
+        // 2. 空数据校验：如果没有数据，停止
+        // 对应您的 JSON: data 为 []，length 为 0，在此处 break 退出
+        if (currentBatch.length === 0) {
+          break;
+        }
+
+        // 3. 合并数据
+        allEpisodes = allEpisodes.concat(currentBatch);
+        
+        // 打印进度日志
+        if (currentBatch.length === limit) {
+           log("info", `[Animeko] ID:${subjectId} 正加载更多剧集 (当前已获: ${allEpisodes.length})`);
+        }
+
+        // 4. 判断是否还有下一页
+        // 如果当前获取的数量少于限制数量 (例如获取了 2 个，而 limit 是 200)，说明是最后一页
+        if (currentBatch.length < limit) {
+          break;
+        }
+
+        // 5. 准备下一页
+        offset += limit;
+
+        // 6. 安全熔断：防止API异常导致死循环
+        if (offset > 1600) {
+            log("warn", `[Animeko] ID:${subjectId} 剧集数量超过安全限制(1600)，停止翻页`);
+            break;
+        }
       }
 
-      const body = resp.data;
-      if (Array.isArray(body.data)) return body.data;
-      
-      return [];
+      return allEpisodes;
+
     } catch (error) {
       log("error", "[Animeko] GetEpisodes error:", {
         message: error.message,
-        id: subjectId
+        id: subjectId,
+        offset: offset
       });
       return [];
     }
@@ -396,28 +525,68 @@ export default class AnimekoSource extends BaseSource {
 
   /**
    * 获取完整弹幕列表
-   * 支持传入纯数字ID或完整URL
+   * 支持自动降级：Global -> CN
    * @param {string} episodeId 剧集 ID 或 完整 API URL
    * @returns {Promise<Array>} 弹幕数组
    */
   async getEpisodeDanmu(episodeId) {
-    try {
-      // 兼容分片请求传递过来的完整 URL
-      const url = episodeId.startsWith('http') 
-        ? episodeId 
-        : `https://danmaku-global.myani.org/v1/danmaku/${episodeId}`;
-        // 目前使用的服务器是全球区域的，备用大陆区域：https://danmaku-cn.myani.org
-
-      const resp = await httpGet(url, { headers: this.headers });
-
-      if (!resp || !resp.data) return [];
-      const body = resp.data;
-      if (body.danmakuList) return body.danmakuList;
-      return [];
-    } catch (error) {
-      log("error", "[Animeko] GetDanmu error:", { message: error.message, url: episodeId });
+    // 1. 提取真实 ID
+    // 兼容分片请求传递过来的完整 URL 或 纯 ID
+    let realId = String(episodeId).trim();
+    
+    // 如果是完整 URL (包含 /)，尝试提取最后一部分
+    if (realId.includes('/')) {
+      const parts = realId.split('/');
+      realId = parts[parts.length - 1]; 
+    }
+    
+    // 去除可能存在的 URL 参数干扰 (例如 ?v=1)
+    if (realId.includes('?')) {
+      realId = realId.split('?')[0];
+    }
+    
+    if (!realId) {
+      log("error", "[Animeko] 无效的 episodeId");
       return [];
     }
+
+    const HOST_GLOBAL = "https://danmaku-global.myani.org";
+    const HOST_CN = "https://danmaku-cn.myani.org";
+
+    // 定义内部通用请求函数
+    const fetchDanmu = async (hostUrl) => {
+      const targetUrl = `${hostUrl}/v1/danmaku/${realId}`;
+      try {
+        const resp = await httpGet(targetUrl, { headers: this.headers });
+        
+        if (!resp || !resp.data) return null;
+        
+        const body = resp.data;
+        if (body.danmakuList) return body.danmakuList;
+        return null;
+      } catch (error) {
+        log("warn", `[Animeko] 请求节点失败: ${hostUrl} - ${error.message}`);
+        return null;
+      }
+    };
+
+    // 2. 优先尝试 Global 节点
+    let danmuList = await fetchDanmu(HOST_GLOBAL);
+
+    // 3. 如果失败，降级尝试 CN 节点
+    if (!danmuList) {
+      log("info", `[Animeko] Global 节点获取失败/无数据，降级尝试 CN 节点... ID:${realId}`);
+      danmuList = await fetchDanmu(HOST_CN);
+    }
+
+    // 4. 返回结果或空数组
+    if (danmuList) {
+      log("info", `[Animeko] 成功获取弹幕，共 ${danmuList.length} 条`);
+      return danmuList;
+    }
+
+    log("error", "[Animeko] 所有节点尝试均失败，无法获取弹幕");
+    return [];
   }
 
   /**
@@ -431,7 +600,7 @@ export default class AnimekoSource extends BaseSource {
         "type": "animeko",
         "segment_start": 0,
         "segment_end": 30000, 
-        "url": `https://danmaku-global.myani.org/v1/danmaku/${id}` // 使用完整 URL
+        "url": String(id)
       }]
     });
   }
@@ -465,7 +634,7 @@ export default class AnimekoSource extends BaseSource {
         const time = (Number(info.playTime) / 1000).toFixed(2);
         const mode = locationMap[info.location] || 1;
         const color = info.color === -1 ? 16777215 : info.color;
-        const text = globals.danmuSimplified ? simplized(info.text) : info.text;
+        const text = globals.danmuSimplifiedTraditional === 'simplified' ? simplized(info.text) : info.text;
 
         return {
           cid: item.id,
@@ -475,3 +644,5 @@ export default class AnimekoSource extends BaseSource {
       });
   }
 }
+
+
